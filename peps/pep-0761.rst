@@ -1,0 +1,841 @@
+PEP: 761
+Title: Adding CRC message digests to the Python standard library
+Author: Andrea Zoppi <texzk@email.it>
+Discussions-To:
+Status: Draft
+Type: Standards Track
+Content-Type: text/x-rst
+Created: 03-Oct-2024
+Python-Version: 3.14
+Post-History:
+
+
+Abstract
+========
+
+This PEP proposes a native extension to the :mod:`hashlib` module, supporting
+any *Cyclic Redundancy Check* (*CRC*) algorithms up to 64-bit width.
+
+
+Motivation
+==========
+
+CRCs are a very common in communication protocols, binary data, and embedded
+systems, especially for validation or safety norms (not for security though).
+Their parameters are often non-standard, or tailored for a specific purpose.
+Thus no two CRCs are always the same, requiring customization to work with.
+
+The Python standard library currently supports many common hashing algorithms,
+yet the support for CRC message digests is scattered across multiple modules,
+often as a byproduct of other libraries, and with only a few supported
+configurations.
+
+There are a handful of third-party Python libraries providing support for CRC
+calculation, but all of them are either:
+
+- very slow, when implemented in pure Python;
+- supporting only a select number of CRC configurations;
+- providing advanced features unnecessary for an average Python user, like C
+  code generation, arbitrary integer precision, or abstraction;
+- requiring a C compiler, as no pre-compiled binaries are provided.
+
+A basic CRC algorithm is very simple and configurable, but also
+computationally expensive, so a native implementation by the Python standard
+library would provide a fast and easy access to such an ubiquitous algorithm.
+
+
+Rationale
+=========
+
+Extending ``hashlib``
+---------------------
+
+CRC can be considered a message digest algorithm, so the most reasonable place
+to add it to the Python standard library is by extending the :mod:`hashlib`
+with a native ``_crc`` module implemented in C, akin to the ``_md5`` or
+``_sha1`` extension modules.
+
+The main way instantiate a CRC object would be via the ``hashlib.crc()``
+function, creating an instance of the internal C object type.
+
+
+CRC Object Features
+-------------------
+
+The internal C object type might be named ``_crc.crcu64``, after the
+``u64`` shorthand for ``uint_fast64_t`` (64-bit or more) [#crcul]_.
+
+Just like any other :mod:`hashlib` objects, a CRC object should ``update()``
+by feeding an input :term:`bytes-like object`.
+The digest result is accessed via the ``digest()`` or ``hexdigest()`` methods.
+
+The actual CRC integer result should be queried by casting the CRC object to
+:class:`int`; this would coerce the CRC object to integer.
+
+Unlike most other :mod:`hashlib` algorithms, a CRC requires some additional
+parameters, which the user can provide upon object creation.
+
+There are several standardized configurations, which the user should be able
+to select by name upon object creation.
+
+The configured parameters should be recalled via homonymous object properties.
+
+
+Customization
+-------------
+
+A CRC algorithm can be customized with the following parameters:
+
+- *width*: the bit width of a CRC word;
+
+- *polynomial*: the multiplier applied at each CRC step;
+
+- *initial*: the initial CRC value;
+
+- *input reflection*: reversing input word bit order upon feeding;
+
+- *output reflection*: reversing internal accumulator bit order before output;
+
+- *output XOR mask*: applied upon CRC value output.
+
+The user should be able to recall a standardized configuration by name at
+object creation, eventually customizing it further.
+
+
+Update Methods
+--------------
+
+The CRC object should provide the following update methods, with an input byte
+buffer:
+
+bitwise
+  The input buffer updates the internal accumulator by one bit for each update
+  step. This is the slowest method, still much faster than a pure Python
+  implementation [#bitwise_bench]_.
+
+bytewise
+  The input buffer updates the internal accumulator by one byte for each
+  update step.
+  The byte selects a tabulated value, increasing the performance and the
+  memory allocation [#bytewise_bench]_.
+  The table is built via the *bitwise* method.
+
+wordwise
+  The input buffer updates the internal accumulator by one word for each
+  update step.
+  Each byte of the word selects a tabulated value, increasing the performance
+  and memory allocation even more [#wordwise_bench]_.
+  The table is built via the *bytewise* method.
+
+The CRC object should also provide update by a single input word with any
+sizes up to 64-bit.
+
+For the sake of completeness, the CRC object should provide methods to update
+by feeding a number of null bits or bytes.
+
+The user should be able to reset the internal state to either the default one
+or by restarting from a specific initial state.
+
+There should be a way to combine the CRC of two subsequent parts.
+
+
+Table Caching
+-------------
+
+The *bytewise* and *wordwise* update methods require precalculated tables.
+
+If the same CRC configuration is instanced multiple times, caching those
+tables would avoid unnecessary calculations, by sharing the very same tables
+across multiple CRC objects.
+
+This caching should be transparent to the user, implemented as an internal
+optimization only.
+
+
+Specification
+=============
+
+This PEP specifies a new extension module named ``_crc`` holding the native
+implementation, imported by the :mod:`hashlib` module for public integration.
+
+
+Global Constants
+----------------
+
+.. data:: _crc.MAX_WIDTH
+
+  Maximum supported bit width.
+
+
+.. data:: _crc.MAX_VALUE
+
+  Maximum supported CRC value.
+
+
+.. data:: _crc.BYTE_WIDTH
+
+  Bit width of a single byte.
+
+
+Global Functions
+----------------
+
+.. function:: _crc.crc([data], *, name=None,  \
+                       width=None, poly=None, init=None,  \
+                       refin=None, refout=None, xorout=None,  \
+                       method='wordwise', usedforsecurity=False)
+
+  Return a new CRC object; optionally initialized with a byte string.
+
+  data
+    Byte string (:term:`bytes-like object`) to update after initialization.
+    If the configured width is less than a whole byte, the upper bits are
+    ignored.
+
+  name
+    Template configuration name.
+    If no other options are provided, default to ``crc-32`` (the same of
+    :func:`zlib.crc32`).
+
+  width
+    CRC bit width, between 1 and ``_crc.MAX_WIDTH``.
+    Mandatory if no name is provided.
+
+  poly
+    CRC polynomial, between 1 and the maximum for the configured width.
+    Mandatory if no name is provided.
+
+  init
+    CRC initial value, compatible with the configured width.
+
+  refin
+    Reversing input bits, across most and least significant bits; bool.
+
+  refout
+    Reversing output bits, across most and least significant bits; bool.
+
+  xorout
+    Output result inversion bit mask. Applied after output bit reversal.
+
+  method
+    Algorithm method, one of: ``bitwise``, ``bytewise``, ``wordwise``.
+
+  usedforsecurity
+    Ignored. Please leave it ``False``, because a CRC is not secure.
+
+
+.. function:: _crc.templates_available()
+
+  Return a dict of the available templates.
+
+  Each template is a tuple: ``(width, poly, init, refin, refout, xorout)``
+  (see ``_crc.crc()`` for their meaning), mapped by the template name.
+
+
+``_crc.crcu64`` Object Type
+---------------------------
+
+The ``_crc.crcu64`` class defines the native C implementation of a CRC
+object.
+It holds the runtime state of a CRC object, as well as references to its
+optimized tables (for *bytewise* and *wordwise* update methods).
+
+
+Getters
+^^^^^^^
+
+Mandatory :mod:`hashlib` API getters:
+
+.. property:: crc.digest_size
+
+  The size of the resulting hash in bytes.
+
+
+.. property:: crc.block_size
+
+  The internal block size of the hash algorithm in bytes.
+
+
+.. property:: crc.name
+
+  The canonical name of this hash algorithm (i.e. ``crc`` for object creation
+  with :func:`hashlib.new`).
+
+
+Specific ``_crc.crcu64`` getters:
+
+.. property:: crc.width
+
+  CRC bit width.
+
+
+.. property:: crc.poly
+
+  CRC polynomial.
+
+
+.. property:: crc.init
+
+  Initial CRC value.
+
+
+.. property:: crc.refin
+
+  Reversing input bits, across most and least significant bits.
+
+
+.. property:: crc.refout
+
+  Reversing output bits, across most and least significant bits.
+
+
+.. property:: crc.xorout
+
+  Inverting bit mask applied upon CRC value output (digest).
+
+
+Methods
+^^^^^^^
+
+Mandatory :mod:`hashlib` API methods:
+
+.. method:: crc.copy()
+
+  Return a copy ("clone") of the hash object.  This can be used to efficiently
+  compute the digests of data sharing a common initial substring.
+
+
+.. method:: crc.digest()
+
+  Return the digest of the data passed to the ``update()`` method so far.
+  The CRC is converted to :class:`bytes` with *big-endian* byte order.
+
+
+.. method:: crc.hexdigest()
+
+  Like ``digest()``, except the digest is returned as an hexadecimal string.
+  The CRC is converted to hex :class:`str` with *big-endian* byte order.
+
+
+.. method:: crc.update(data, /)
+
+  Update the hash object with the :term:`bytes-like object`.
+  Repeated calls are equivalent to a single call with the
+  concatenation of all the arguments: ``m.update(a); m.update(b)`` is
+  equivalent to ``m.update(a+b)``.
+
+  data
+    Input byte string (:term:`bytes-like object`).
+    If the configured width is less than a whole byte, the upper bits of each
+    byte are ignored.
+
+
+Specific ``_crc.crcu64`` methods:
+
+.. method:: crc.combine(crc1, crc2, len2, /)
+
+  Return the combined CRC of the two parts.
+
+  The CRC of the two parts must be generated by the same configuration of this
+  CRC object.
+  This method leaves the internal state of the CRC object unchanged.
+
+  crc1
+    CRC result of the first part.
+
+  crc2
+    CRC result of the second part.
+
+  len2
+    Length of the second part, in bytes.
+
+
+.. method:: crc.clear(init=None, /)
+
+  Reset internal computations.
+
+  Computations resume from the provided initial value, or the default if not
+  provided instead.
+
+  init
+    Initial CRC value.
+
+
+.. method:: crc.update_word(word, width, /)
+
+  Update this object's state with the provided word.
+
+  word
+    Integer data word to feed to the CRC algorithm.
+    Any bits above width are ignored.
+
+  width
+    Number of data word bits to process, up to the configured CRC width.
+
+
+.. method:: crc.zero_bits(numbits, /)
+
+  Update this object's state with a number of zero (null) bits.
+
+  numbits
+    Number of input bits.
+
+
+.. method:: crc.zero_bytes(numbytes, /)
+
+  Update this object's state with a number of zero (null) bytes.
+
+  numbytes
+    Number of input bytes.
+
+
+Slots
+^^^^^
+
+.. method:: crc.__index__()
+
+  (``Py_nb_index``) Converts the CRC result to an integer object.
+
+
+C Type Definitions
+------------------
+
+Here's a preview of possible C type defintions within the ``_crc`` module.
+
+
+Implementation Types
+^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: c
+
+  /* Integer type shortcuts for CRC algorithms */
+  typedef uint_least8_t   crc_u8;
+  typedef uint_fast16_t   crc_u16;
+  typedef uint_fast32_t   crc_u32;
+  typedef uint_fast64_t   crc_u64;
+
+  /* CRC configuration descriptor */
+  typedef struct {
+      crc_u64 poly;       /* polynomial */
+      crc_u64 init;       /* initial value */
+      crc_u64 xorout;     /* output XOR mask */
+      crc_u8 width;       /* bit width */
+      crc_u8 refin;       /* reflected input */
+      crc_u8 refout;      /* reflected output */
+  } crc_config;
+
+  struct crcu64_impl;  /* forward declaration */
+
+  /* Update function prototype */
+  typedef void (*crcu64_func_update)(struct crcu64_impl *impl,
+                                     const crc_u8 *data,
+                                     size_t size);
+
+The ``crc_config`` struct is the universal CRC configuration descriptor.
+
+
+Implementation Struct
+^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: c
+
+  /* Implementation of a CRC algorithm */
+  typedef struct crcu64_impl {
+      crc_u64 init;               /* optimized initial value */
+      crc_u64 poly;               /* optimized polynomial */
+      crc_u64 accum;              /* optimized current accumulator */
+      crc_u64 xorout;             /* optimized output XOR mask */
+      crc_u64 result;             /* cached digest result */
+      crcu64_func_update update;  /* optimized update function */
+      crc_u64 *bytewise;          /* optimized bytewise table, or NULL */
+      crc_u64 *wordwise;          /* optimized wordwise table, or NULL */
+      crc_u8 width;               /* bit width */
+      crc_u8 refin;               /* reflected input */
+      crc_u8 refout;              /* reflected output */
+      crc_u8 dirty;               /* internal state changed */
+  } crcu64_impl;
+
+Most of the fields are as already discussed.
+
+Some are optimized for the actual algorithm implementation, e.g. with
+precalculated reflections or shifts.
+
+accum
+  The underlying CRC accumulator, optimized for speed.
+
+result
+  The latest output result, i.e. the one used by ``crc.digest()``.
+
+update
+  The byte update function, according to the configured update method
+  (*bitwise*, *bytewise*, or *wordwise*).
+
+bytewise
+  A raw pointer to the first item of ``crcu64object::tabbuf_bytes``;
+  ``NULL`` if the configured update method is not *bytewise* nor *wordwise*.
+
+wordwise
+  A raw pointer to the first item of ``crcu64object::tabbuf_words``;
+  ``NULL`` if the configured update method is not *wordwise*.
+
+dirty
+  Tracks whether the ``result`` is out of date.
+
+
+``_crc.crcu64`` Object Type
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: c
+
+  /* CRC object status variables */
+  typedef struct {
+      PyObject_HEAD
+      PyObject *tabbuf_bytes;     /* PyByteArrayObject */
+      PyObject *tabbuf_words;     /* PyByteArrayObject */
+      crcu64_impl impl;
+      /* Prevents undefined behavior via multiple threads entering the C API. */
+      PyMutex mutex;
+      bool use_mutex;
+  } crcu64object;
+
+tabbuf_bytes
+  A ``PyByteArrayObject`` hosting the lookup table for the *bytewise* update
+  method.
+  The table has 256 ``uint_fast64_t`` items, one for each possible byte value.
+  ``NULL`` if the configured update method is not *bytewise* nor *wordwise*.
+
+tabbuf_words
+  A ``PyByteArrayObject`` hosting the lookup table for the *wordwise* update
+  method.
+  The table has 8*256 ``uint_fast64_t`` items, one for each possible byte
+  value of the bytes of a ``uint_fast64_t`` word.
+  ``NULL`` if the configured update method is not *wordwise*.
+
+impl
+  The C struct implementing the underlying CRC algorithm itself.
+
+mutex
+  A ``PyMutex`` added according to the :mod:`hashlib` extension modules.
+
+
+``_crc`` Module State Type
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: c
+
+  /* Module state variables */
+  typedef struct {
+      PyObject *id_name_default;          /* PyUnicodeObject */
+      PyObject *crcu64_type;              /* PyTypeObject */
+      PyObject *crcu64_bytewise_cache;    /* PyDictObject */
+      PyObject *crcu64_wordwise_cache;    /* PyDictObject */
+  } crcmodule_state;
+
+id_name_default
+  A ``PyUnicodeObject`` hosting the default template name (i.e. ``crc-32``).
+
+crcu64_type
+  The ``PyTypeObject`` holding the ``_crc.crcu64`` object type.
+
+crcu64_bytewise_cache
+  A ``PyDictObject`` tracking all the cached *bytewise* tables.
+  Each *key* is a ``crc_config`` struct converted to ``PyBytesObject``.
+  Each *value* is like ``crcu64object::tabbuf_bytes``.
+
+crcu64_wordwise_cache
+  A ``PyDictObject`` tracking all the cached *wordwise* tables.
+  Each *key* is a ``crc_config`` struct converted to ``PyBytesObject``.
+  Each *value* is like ``crcu64object::tabbuf_words``.
+
+
+Integration Into ``hashlib``
+----------------------------
+
+The ``_crc`` module should be integrated as per its sibling modules, such as
+``_md5`` or ``_sha1``.
+
+This adds ``crc`` as a supported name, targeting the ``_crc.crc()`` function.
+This allows calling ``hashlib.crc()`` to instantiate a CRC object, with the
+same args of ``_crc.crc()``.
+
+
+Examples
+--------
+
+Common Operations
+^^^^^^^^^^^^^^^^^
+
+Here are some examples showing the most common CRC operations:
+
+.. code-block:: pycon
+
+  >>> import hashlib
+  >>> # Create a CRC-16/CCITT-FALSE feeding it with a byte string immediately
+  >>> crc = hashlib.crc(b'123456789', name='crc-16-ccitt-false')
+  >>> int(crc)  # integer result
+  10673
+  >>> hex(crc)  # implicit integer coercion
+  '0x29b1'
+  >>> crc.digest()  # bytes digest, implicit big-endian
+  b')\xb1'
+  >>> crc.digest()[::-1]  # bytes digest, manual little-endian
+  b'\xb1)'
+  >>> crc.hexdigest()  # hex digest, implicit big-endian
+  '29b1'
+  >>> crc.update(b'abcdef')  # feed more bytes
+  >>> hex(crc)
+  '0xc378'
+  >>> crc.clear(0x29b1)  # restart from a previous result
+  >>> crc.update(b'abcdef')  # the second byte string again
+  >>> hex(crc)
+  '0xc378'
+  >>> crc.clear()  # restart from the initial state
+  >>> hex(crc)
+  '0xffff'
+  >>> crc.update(b'123456789')  # the first byte string again
+  >>> hex(crc)
+  '0x29b1'
+
+
+Custom CRC
+^^^^^^^^^^
+
+Advanced uses might require specific tailoring.
+Here's a *CRC-16/CCITT-FALSE* created from scratch, specifying the non-default
+parameters only:
+
+.. code-block:: pycon
+
+  >>> import hashlib
+  >>> crc = hashlib.crc(width=16, poly=0x1021, init=0xFFFF)
+  >>> hex(crc)
+  '0xffff'
+  >>> crc.update(b'123456789')
+  >>> hex(crc)
+  '0x29b1'
+
+
+Combining Two CRCs
+^^^^^^^^^^^^^^^^^^
+
+A CRC object allows combining the CRC results of two parts, as if they were
+concatenated:
+
+.. code-block:: pycon
+
+  >>> import hashlib
+  >>> name = 'crc-16-ccitt-false'
+  >>> hex(hashlib.crc(b'123456789abcdef', name=name))  # expected result
+  '0xc378'
+  >>> crc1 = int(hashlib.crc(b'123456789', name=name))
+  >>> hex(crc1)
+  '0x29b1'
+  >>> crc2 = int(hashlib.crc(b'abcdef', name=name))
+  >>> hex(crc2)
+  '0x34ed'
+  >>> crc12 = hashlib.crc(name=name).combine(crc1, crc2, len(b'abcdef'))
+  >>> hex(crc12)
+  '0xc378'
+
+
+Available Templates
+^^^^^^^^^^^^^^^^^^^
+
+The user can retrieve the available templates into a dictionary:
+
+.. code-block:: pycon
+
+  >>> import _crc
+  >>> from pprint import pprint
+  >>> # {name: (width, poly, init, refin, refout, xorout), ...}
+  >>> pprint(_crc.templates_available(), width=150)
+  {'arc': (16, 32773, 0, True, True, 0),
+   'b-crc-32': (32, 79764919, 4294967295, False, False, 4294967295),
+   'cksum': (32, 79764919, 0, False, False, 4294967295),
+      ...
+   'xfer': (32, 175, 0, False, False, 0),
+   'xmodem': (16, 4129, 0, False, False, 0),
+   'zmodem': (16, 4129, 0, False, False, 0)}
+
+
+Backwards Compatibility
+=======================
+
+This PEP is about extending the standard library, so no backwards
+compatibility issues are known.
+
+
+Assumptions
+===========
+
+The actual CRC configurations used in real world applications are mostly up to
+64-bit word width.
+While there exist a few with a wider word size, they happen to be used by
+small specialized groups of products.
+
+This PEP limits support to up to 64-bit CRC configurations, leaving wider ones
+to third-party libraries with arbitrary integer precision, despite a huge hit
+on performance.
+
+This PEP limits support to 64-bit because most contemporary CPU architectures
+provide direct hardware support for 64-bit integers, handled by their C
+compilers by the native ``uint_fast64_t`` data type [#ull32bit]_.
+
+
+Security Implications
+=====================
+
+The extension module itself should have no impact on general security.
+
+CRC algorithms are weak against security attacks, so their use for a security
+context should be explicitly discouraged.
+
+
+Reference Implementation
+========================
+
+An implementation of this PEP is
+`available in the author's fork <https://github.com/python/cpython/compare/main...TexZK:crcmodule>`__.
+
+
+Possible Future Enhancements
+============================
+
+32-bit Variant
+--------------
+
+This PEP currently focuses on ``uint_fast64_t`` as the universal data type
+for any CRC configurations up to 64-bit width.
+
+This is usually a waste of performance on 32-bit CPU architectures, which
+would require multiple operations to emulate 64-bit calculations, even for
+those CRCs up to 32-bit.
+
+A future enhancement might duplicate the implementation to switch to the
+``uint_fast32_t`` data type for those CRC configurations up to 32-bit, while
+keeping the ``uint_fast64_t`` implementation for bigger CRC widths.
+
+This code duplication should be compiled only for those 32-bit CPU
+architectures without 64-bit integer hardware support.
+
+
+Arbitrary Precision Variant
+---------------------------
+
+A Pure Python arbitrary precision variant might still be provided as a sibling
+module, following the same API.
+
+
+Hardware Acceleration
+---------------------
+
+CPU architectures often provide hardware support for CRC calculation, either
+with CRC-specific or SIMD instructions, which could improve performance.
+
+This PEP is only about a pure C implementation, without any CPU-specific code,
+to be as simple and portable as possible, while being reasonably fast.
+
+Furthermore, CPU-specific code usually complicates both the code base and the
+build system by a huge factor; the use case for this library would hardly
+justify such an added complexity.
+
+
+Acknowledgments
+===============
+
+Most of the recent libraries made for CRC calculations are based on the
+`CRC Catalogue <https://reveng.sourceforge.io/crc-catalogue/>`__ by Greg Cook,
+who in turn collected information as acknowledged on his own website.
+
+This PEP is based on that CRC catalogue as well, following its naming
+conventions and data.
+
+Many thanks to Mark Adler, for his useful insights about CRC algorithms.
+
+
+CRC Catalogue Disclaimer
+------------------------
+
+   Every effort has been made to ensure accuracy, however there may be
+   occasional errors or omissions.
+   All trademarks and registered trademarks are the intellectual property of
+   their respective owners.
+   The code and documentation included in this document are supplied without
+   warranty, not even the implied warranties of merchantability or fitness for
+   a particular purpose.
+   In no event shall the author or his suppliers be liable for any loss,
+   damage, injury or death, of any nature and howsoever caused, arising from
+   the use of, or failure, inability or unwillingness to use, this software or
+   documentation.
+
+
+Rejected Ideas
+==============
+
+Pure Python
+-----------
+
+A pure Python variant would be too slow: a typical *bytewise* implementation
+can be 250 times slower than in C [#bytewise_bench]_, and 1000 times slower
+than *wordwise* in C [#wordwise_bench]_.
+
+When dealing with big datasets this adds up, degrading the user experience and
+real-time processing by a huge degree.
+
+
+Dedicated Module
+----------------
+
+Creating a dedicated public ``crc`` module would require a big effort to set
+up the code base infrastructure and testing.
+
+Extending the :mod:`hashlib` is instead the natural choice, because CRC is
+indeed a message digest algorithm, and the effort for the extension of
+:mod:`hashlib` is very manageable, as already done for other algorithms such
+as *MD5* or *SHA-1*.
+
+
+Smaller Data Types
+------------------
+
+Most of other C implementations use smaller data types for smaller CRC word
+widths, while this PEP uses ``uint_fast64_t`` only.
+
+As most modern CPU architectures running Python do indeed have a 64-bit ALU
+available (be it the main ALU, a DSP accelerator, or SIMD), there is no point
+in duplicating the implementation for smaller data types, just for saving a
+few allocated bytes and a rather small improvement in performance (around
+10 %).
+
+As stated for the possible future enhancements, the only alternative
+implementation making sense would be a 32-bit variant for lesser CPUs
+(``uint_fast32_t``), to maximize performance while still using pure C.
+
+
+Footnotes
+=========
+
+.. [#crcul] This leaves room for future changes, like a ``_crc.crcu32``
+   internal C object type for an ``uint_fast32_t`` variant on lesser 32-bit
+   CPU architectures.
+
+.. [#bitwise_bench] A benchmark on a *i7-6700K* machine shows that *bitwise*
+   is more than 20 times faster than a pure Python implementation in
+   *bytewise* fashion.
+
+.. [#bytewise_bench] A benchmark on a *i7-6700K* machine shows that *bytewise*
+   is roughly 12 times as fast as *bitwise*. The table allocates 2 KiB.
+
+.. [#wordwise_bench] A benchmark on a *i7-6700K* machine shows that *wordwise*
+   is roughly 4 times as fast as *bytewise*. The table allocates 16 KiB.
+
+.. [#ull32bit] Contemporary C compilers can emulate the 64-bit features of the
+   ``uint_fast64_t`` data type even on 32-bit CPU architectures with the
+   very same source code, despite a hit on performance.
+
+
+Copyright
+=========
+
+This document is placed in the public domain or under the
+CC0-1.0-Universal license, whichever is more permissive.
